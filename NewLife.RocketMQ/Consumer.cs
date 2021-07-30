@@ -325,9 +325,7 @@ namespace NewLife.RocketMQ
         private void DoSchedule()
         {
             var qs = _Queues;
-            if (qs == null || qs.Length == 0) return;
-
-            _version++;
+            if (qs == null) return;
 
             // 关线程
             Stop();
