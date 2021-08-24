@@ -115,7 +115,7 @@ namespace NewLife.RocketMQ.Client
 
         /// <summary>友好字符串</summary>
         /// <returns></returns>
-        public override String ToString() => Group;
+        public override String ToString() => $"{Topic}#{Group}";
         #endregion
 
         #region 基础方法
@@ -283,6 +283,16 @@ namespace NewLife.RocketMQ.Client
         /// <param name="format"></param>
         /// <param name="args"></param>
         public void WriteLog(String format, params Object[] args) => Log?.Info($"[{this}]" + format, args);
+
+        /// <summary>
+        /// 写警告日志
+        /// </summary>
+        public void WriteWarnLog(String format, params Object[] args) => Log?.Warn($"[{this}]" + format, args);
+
+        /// <summary>
+        /// 写错误日志
+        /// </summary>
+        public void WriteErrorLog(String format, params Object[] args) => Log?.Error($"[{this}]" + format, args);
         #endregion
     }
 }

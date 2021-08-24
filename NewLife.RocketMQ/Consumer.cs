@@ -7,7 +7,6 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
-using NewLife.Log;
 using NewLife.Reflection;
 using NewLife.RocketMQ.Client;
 using NewLife.RocketMQ.Protocol;
@@ -48,6 +47,11 @@ namespace NewLife.RocketMQ
 
         /// <summary>消费委托</summary>
         public Func<MessageQueue, MessageExt[], Boolean> OnConsume;
+
+        /// <summary>
+        /// <see cref="Rebalance"/>成功执行后的回调，暂时用于group首次订阅时，重试队列在原队列成功订阅后才会生成，所以重试队列的订阅将在该回调之后进行
+        /// </summary>
+        public Action<MessageQueue[]> AfterRebalance { get; set; }
         #endregion
 
         #region 构造
@@ -148,7 +152,7 @@ namespace NewLife.RocketMQ
                 else
                 {
                     pr.Status = PullStatus.Unknown;
-                    Log.Warn("响应编号：{0} 响应备注：{1} 序列编号：{2} 序列偏移量：{3}", rs.Header.Code, rs.Header.Remark, mq.QueueId, offset);
+                    WriteWarnLog("响应编号：{0} 响应备注：{1} 序列编号：{2} 序列偏移量：{3}", rs.Header.Code, rs.Header.Remark, mq.QueueId, offset);
                 }
 
                 pr.Read(rs.Header?.ExtFields);
@@ -260,6 +264,36 @@ namespace NewLife.RocketMQ
             return true;
         }
 
+        /// <summary>
+        /// 将消息推送到重试(RETRY)队列中，达到最大消费次数后将自动推送到死信(DLQ)队列
+        /// </summary>
+        public async Task SendMessageBackAsync(MessageQueue queue, MessageExt msg)
+        {
+            var broker = GetBroker(queue.BrokerName);
+            var delayLevel = msg.DelayTimeLevel + 1;
+            var i = 0;
+            while (i++ < 3)
+            {
+                var result = await broker.InvokeAsync(RequestCode.CONSUMER_SEND_MSG_BACK, null, new
+                {
+                    group = Group,
+                    originTopic = Topic,
+                    offset = msg.CommitLogOffset,
+                    delayLevel = delayLevel,
+                    originMsgId = msg.MsgId,
+                    maxReconsumeTimes = 18
+                }, true);
+                if (result.Header != null && result.Header.Code == 0) return;
+#if NET40
+                Thread.Sleep(100);
+#else
+                await Task.Delay(100);
+#endif
+                broker.Ping();
+            }
+            WriteErrorLog("将消息推送到重试队列失败，msgId: {2}, delayLevel: {3}", Topic, Group, msg.MsgId, delayLevel);
+        }
+
         /// <summary>获取消费者下所有消费者</summary>
         /// <param name="group"></param>
         public ICollection<String> GetConsumers(String group = null)
@@ -279,7 +313,7 @@ namespace NewLife.RocketMQ
                 try
                 {
                     var bk = GetBroker(item.Name);
-                    //bk.Ping();
+                    bk.Ping(); // 不ping的话在Release模式下下面的GET_CONSUMER_LIST_BY_GROUP有概率获取不到有效数据
                     var rs = bk.Invoke(RequestCode.GET_CONSUMER_LIST_BY_GROUP, null, header);
                     //WriteLog(rs.Header.ExtFields?.ToJson());
                     var js = rs.ReadBodyAsJson();
@@ -293,8 +327,7 @@ namespace NewLife.RocketMQ
                 }
                 catch (Exception ex)
                 {
-                    //XTrace.WriteException(ex);
-                    WriteLog(ex.GetTrue().Message);
+                    WriteErrorLog(ex.GetTrue().Message);
                 }
             }
 
@@ -399,14 +432,17 @@ namespace NewLife.RocketMQ
                                     // 触发消费
                                     var rs = Consume(mq, pr);
 
-                                    // 更新偏移
-                                    if (rs)
+                                    if (!rs)
                                     {
-                                        st.Offset = pr.NextBeginOffset;
-
-                                        // 提交消费进度
-                                        await UpdateOffset(mq, st.Offset);
+                                        foreach (var message in pr.Messages)
+                                        {
+                                            await SendMessageBackAsync(mq, message);
+                                        }
                                     }
+                                    // 更新偏移
+                                    // 提交消费进度
+                                    st.Offset = pr.NextBeginOffset;
+                                    await UpdateOffset(mq, st.Offset);
                                 }
                                 break;
                             case PullStatus.NoNewMessage:
@@ -421,7 +457,7 @@ namespace NewLife.RocketMQ
                                 }
                                 break;
                             case PullStatus.Unknown:
-                                Log.Error("未知响应类型消息序列[{1}]偏移量{0}", st.Offset, st.Queue.QueueId);
+                                WriteErrorLog("未知响应类型消息序列[{1}]偏移量{0}", st.Offset, st.Queue.QueueId);
                                 break;
                             default:
                                 break;
@@ -576,7 +612,12 @@ namespace NewLife.RocketMQ
             WriteLog("消费重新平衡，当前消费者负责queue分片：{0}", dic.Join(";", e => $"{e.Key}[{e.Value}]"));
 
             _Queues = rs.ToArray();
-            InitOffsetAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+            var successed = InitOffsetWithRetryAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+            if (!successed)
+            {
+                _Queues = null;
+                return false;
+            }
             _Consumers = cs2.ToArray();
 
             return true;
@@ -603,6 +644,7 @@ namespace NewLife.RocketMQ
                 try
                 {
                     if (!Rebalance()) return;
+                    AfterRebalance?.Invoke(Queues);
 
                     if (AutoSchedule) DoSchedule();
 
@@ -611,7 +653,7 @@ namespace NewLife.RocketMQ
                 }
                 catch (Exception ex)
                 {
-                    XTrace.WriteException(ex);
+                    WriteErrorLog(ex.GetTrue().Message);
                 }
                 finally
                 {
@@ -620,9 +662,25 @@ namespace NewLife.RocketMQ
             }
         }
 
-        private async Task InitOffsetAsync()
+        private async Task<bool> InitOffsetWithRetryAsync()
         {
-            if (_Queues == null || _Queues.Length == 0) return;
+            for (var i = 0; i < 3; i++)
+            {
+                var successed = await InitOffsetAsync().ConfigureAwait(false);
+                if (successed) return true;
+#if NET40
+                Thread.Sleep(300);
+#else
+                await Task.Delay(300 * (i + 1));
+#endif
+            }
+            WriteErrorLog("无法获取到消费统计数据");
+            return false;
+        }
+
+        private async Task<bool> InitOffsetAsync()
+        {
+            if (_Queues == null || _Queues.Length == 0) return true;
 
             var broker = GetBroker(_Queues[0].Queue.BrokerName);
             // 这指令需要group参数，然而查出来的数据是跟group无关的就离谱
@@ -631,6 +689,7 @@ namespace NewLife.RocketMQ
             //    group = Group,
             //    topic = Topic
             //}, true);
+            broker.Ping(); // 在启动多个consumer的情况下，如果不先ping一下，高概率读取不到有效配置（release下高概率）
             var command = await broker.InvokeAsync(RequestCode.GET_CONSUME_STATS, null, new
             {
                 consumerGroup = Group,
@@ -640,6 +699,12 @@ namespace NewLife.RocketMQ
             var regex = new Regex("\\{\"brokerName\":\"[^\"]+\",\"queueId\":(\\d+),\"topic\":\"[^\"]+\"\\}:\\{\"brokerOffset\":(\\d+),\"consumerOffset\":(\\d+),\"lastTimestamp\":(\\d+)\\}", RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
             var json = command.Payload.ToStr();
             var matches = regex.Matches(json);
+            if(matches.Count < _Queues.Length)
+            {
+                // 未知原因，可能获取失败
+                WriteWarnLog("无法获取到消费统计数据，json: {0}", json);
+                return false;
+            }
             // Dictionary<queueId, new[]{brokerOffset, consumerOffset}>
             var queueOffsets = new Dictionary<Int32, Int64[]>();
             var neverConsumed = true;
@@ -694,10 +759,11 @@ namespace NewLife.RocketMQ
                 }
                 WriteLog("初始化offset[{0}@{1}] Offset={2:n0}", store.Queue.BrokerName, store.Queue.QueueId, store.Offset);
             }
+            return true;
         }
-        #endregion
+#endregion
 
-        #region 下行指令
+#region 下行指令
         /// <summary>收到命令</summary>
         /// <param name="cmd"></param>
         protected override Command OnReceive(Command cmd)
@@ -809,6 +875,6 @@ namespace NewLife.RocketMQ
 
             return rs;
         }
-        #endregion
+#endregion
     }
 }
